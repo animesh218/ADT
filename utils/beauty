@@ -1,0 +1,377 @@
+import pandas as pd
+import sys
+import logging
+import os
+from datetime import datetime
+
+
+class DataTransformer:
+    """
+    A class to handle data transformation operations.
+    Transforms property data from one CSV format to another with specific business requirements.
+    Now supports reading event names from the input data and saving verification info to a file.
+    """
+    
+    def __init__(self, logger=None):
+        """Initialize the DataTransformer with optional logger."""
+        self.logger = logger or self._setup_default_logger()
+    
+    def _setup_default_logger(self):
+        """Setup and return a default logger if none is provided."""
+        logger = logging.getLogger('DataTransformer')
+        logger.setLevel(logging.INFO)
+        
+        # Create console handler
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        
+        # Add handler to logger
+        logger.addHandler(ch)
+        return logger
+    
+    def extract_property_rates(self, df_raw):
+        """
+        Extract property rates from the first row of the dataframe.
+        
+        Args:
+            df_raw: Raw pandas dataframe with rates in the first row
+            
+        Returns:
+            dict: Dictionary mapping column index to rate value
+        """
+        try:
+            property_rates = {}
+            for col_idx in range(2, len(df_raw.columns)):  # Start from index 2 to skip date and event columns
+                property_rates[col_idx] = df_raw.iloc[0, col_idx]
+            return property_rates
+        except Exception as e:
+            self.logger.error(f"DataTransformer.extract_property_rates: Error extracting rates: {str(e)}")
+            raise
+    
+    def read_input_data(self, input_csv_path):
+        """
+        Read the input CSV file and extract necessary components.
+        Now accounts for event column in the input data.
+        
+        Args:
+            input_csv_path: Path to the input CSV file
+            
+        Returns:
+            tuple: (df_input, column_names, property_rates, date_column, event_column)
+        """
+        try:
+            self.logger.info(f"Reading input file: {input_csv_path}")
+            
+            # First, attempt to detect the file's delimiter by reading a few lines
+            with open(input_csv_path, 'r') as f:
+                first_line = f.readline().strip()
+                
+            # Check if the file is comma-separated or has another delimiter
+            if ',' in first_line:
+                delimiter = ','
+            elif ';' in first_line:
+                delimiter = ';'
+            elif '\t' in first_line:
+                delimiter = '\t'
+            else:
+                delimiter = ','  # Default to comma if no obvious delimiter
+                
+            self.logger.info(f"Detected delimiter: '{delimiter}'")
+            
+            # Read the entire CSV file with the detected delimiter
+            df_raw = pd.read_csv(input_csv_path, header=None, delimiter=delimiter, engine='python')
+            
+            # Log the shape of the dataframe for debugging
+            self.logger.info(f"Raw dataframe shape: {df_raw.shape}")
+            
+            # Print the first few rows of the raw data for debugging
+            self.logger.info(f"First 3 rows of raw data:\n{df_raw.head(3)}")
+            
+            # Extract rates
+            property_rates = self.extract_property_rates(df_raw)
+            
+            # Get column names from the second row
+            column_names = df_raw.iloc[1].tolist()
+            
+            # Find the date and event column indices
+            date_col_idx = 0  # Default to first column
+            event_col_idx = 1  # Default to second column
+            
+            date_column = column_names[date_col_idx]
+            event_column = column_names[event_col_idx]
+            
+            self.logger.info(f"Identified date column: {date_column}, event column: {event_column}")
+            
+            # Create a new dataframe with proper headers from row 2 onwards
+            df_input = pd.DataFrame(df_raw.iloc[2:].values, columns=column_names)
+            
+            # Convert numeric columns to appropriate data types
+            property_columns = [col for col in column_names if col not in [date_column, event_column]]
+            
+            for col in property_columns:
+                df_input[col] = pd.to_numeric(df_input[col], errors='coerce')
+            
+            return df_input, column_names, property_rates, date_column, event_column
+        except Exception as e:
+            self.logger.error(f"DataTransformer.read_input_data: Failed to read input data: {str(e)}")
+            self.logger.error(f"Traceback:", exc_info=True)
+            raise
+    
+    def transform_row_data(self, row, date_column, event_column, property_columns, property_rates):
+        """
+        Transform a single row from input format to output format.
+        Now includes event information from the input data.
+        
+        Args:
+            row: Input dataframe row
+            date_column: Name of the date column
+            event_column: Name of the event column
+            property_columns: List of property column names
+            property_rates: Dictionary of property rates
+            
+        Returns:
+            list: List of transformed row dictionaries
+        """
+        try:
+            date = row[date_column]
+            event = row[event_column]
+            transformed_rows = []
+            
+            # For each property column, create a new row in the output format
+            for col_idx, prop in enumerate(property_columns, start=2):  # Start from 2 to account for date and event
+                # Get the rate for this property from the rates dictionary
+                rate = property_rates.get(col_idx, 0)
+                
+                # Only create a row if the property value is not NaN
+                if pd.notna(row[prop]):
+                    transformed_row = {
+                        'date': date,
+                        'event': event,
+                        'property': prop,
+                        'impressions': 0,
+                        'bu': 'PERSONAL CARE',
+                        'allocation': row[prop],
+                        'price_type': 'CPM',
+                        'rate': rate,
+                        'supply': row[prop],
+                        'page': 'BEAUTY'
+                    }
+                    transformed_rows.append(transformed_row)
+            
+            return transformed_rows
+        except Exception as e:
+            self.logger.error(f"DataTransformer.transform_row_data: Error transforming row data: {str(e)}")
+            raise
+    
+    def generate_verification_info(self, df_output, verification_file=None):
+        """
+        Generate and log verification information about the transformed data.
+        Also writes the verification information to a text file if specified.
+        
+        Args:
+            df_output: Transformed output dataframe
+            verification_file: Optional path to write verification info to a text file
+        """
+        try:
+            # Create a list to store verification info lines for the file
+            verification_lines = ["--- VERIFICATION INFORMATION ---"]
+            
+            # 1. Display the rate of each property
+            self.logger.info("1. Rate for each property:")
+            verification_lines.append("\n1. Rate for each property:")
+            
+            property_rates_df = df_output[['property', 'rate']].drop_duplicates()
+            for _, row in property_rates_df.iterrows():
+                info_line = f"   {row['property']}: {row['rate']}"
+                self.logger.info(info_line)
+                verification_lines.append(info_line)
+            
+            # 2. Calculate and display the sum of allocation and sum of supply
+            total_allocation = df_output['allocation'].sum()
+            total_supply = df_output['supply'].sum()
+            
+            self.logger.info("2. Summary totals:")
+            verification_lines.append("\n2. Summary totals:")
+            
+            info_line = f"   Total Allocation: {total_allocation:,.0f}"
+            self.logger.info(info_line)
+            verification_lines.append(info_line)
+            
+            info_line = f"   Total Supply: {total_supply:,.0f}"
+            self.logger.info(info_line)
+            verification_lines.append(info_line)
+            
+            # 3. Count events
+            event_counts = df_output['event'].value_counts()
+            
+            self.logger.info("3. Event distribution:")
+            verification_lines.append("\n3. Event distribution:")
+            
+            for event, count in event_counts.items():
+                info_line = f"   {event}: {count} entries"
+                self.logger.info(info_line)
+                verification_lines.append(info_line)
+            
+            # Display first few rows of the output
+            self.logger.info("Output Preview:")
+            verification_lines.append("\nOutput Preview:")
+            
+            output_preview = df_output.head().to_string()
+            self.logger.info(f"\n{output_preview}")
+            verification_lines.append(output_preview)
+            
+            # If a verification file path is provided, write the information to the file
+            if verification_file:
+                try:
+                    with open(verification_file, 'w') as f:
+                        f.write('\n'.join(verification_lines))
+                    self.logger.info(f"Verification information written to {verification_file}")
+                except Exception as file_error:
+                    self.logger.error(f"Failed to write verification info to file: {str(file_error)}")
+            
+        except Exception as e:
+            self.logger.error(f"DataTransformer.generate_verification_info: Error generating verification info: {str(e)}")
+            # Not raising here, as this is supplementary information
+
+
+class Workflow:
+    """
+    Workflow class to orchestrate the transformation process.
+    """
+    
+    def __init__(self):
+        """Initialize the workflow with a logger and transformer."""
+        self.logger = self._setup_logger()
+        self.transformer = DataTransformer(self.logger)
+    
+    def _setup_logger(self):
+        """Setup and return a logger for the workflow."""
+        logger = logging.getLogger('TransformationWorkflow')
+        logger.setLevel(logging.INFO)
+        
+        # Create console handler and file handler
+        ch = logging.StreamHandler()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fh = logging.FileHandler(f'transform_log_{timestamp}.log')
+        
+        ch.setLevel(logging.INFO)
+        fh.setLevel(logging.INFO)
+        
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        fh.setFormatter(formatter)
+        
+        # Add handlers to logger
+        logger.addHandler(ch)
+        logger.addHandler(fh)
+        
+        return logger
+    
+    def run_transformation(self, input_csv_path, output_csv_path, verification_file=None):
+        """
+        Execute the transformation workflow.
+        Now supports reading event names from the input data and saving verification info.
+        
+        Args:
+            input_csv_path: Path to the input CSV file
+            output_csv_path: Path for the output CSV file
+            verification_file: Optional path for verification info file
+            
+        Returns:
+            DataFrame or None: The transformed dataframe if successful, None otherwise
+        """
+        try:
+            self.logger.info(f"Starting transformation workflow for {input_csv_path}")
+            
+            # If verification_file is not provided, generate one based on output filename
+            if verification_file is None:
+                base_output_path = os.path.splitext(output_csv_path)[0]
+                verification_file = f"{base_output_path}_verification.txt"
+            
+            self.logger.info(f"Verification information will be saved to: {verification_file}")
+            
+            # Step 1: Read and parse input data
+            df_input, column_names, property_rates, date_column, event_column = self.transformer.read_input_data(input_csv_path)
+            self.logger.info(f"Successfully read input data with {len(df_input)} rows")
+            
+            # Step 2: Identify property columns (excluding date and event columns)
+            property_columns = [col for col in column_names if col not in [date_column, event_column]]
+            self.logger.info(f"Identified {len(property_columns)} property columns: {property_columns}")
+            
+            # Step 3: Transform data row by row
+            transformed_data = []
+            for idx, row in df_input.iterrows():
+                row_data = self.transformer.transform_row_data(row, date_column, event_column, property_columns, property_rates)
+                transformed_data.extend(row_data)
+            
+            self.logger.info(f"Transformed data into {len(transformed_data)} rows")
+            
+            # Step 4: Create the output dataframe
+            df_output = pd.DataFrame(transformed_data)
+            
+            # Step 5: Ensure allocation and supply are numeric
+            df_output['allocation'] = pd.to_numeric(df_output['allocation'], errors='coerce')
+            df_output['supply'] = pd.to_numeric(df_output['supply'], errors='coerce')
+            
+            # Step 6: Save to output CSV
+            df_output.to_csv(output_csv_path, index=False)
+            self.logger.info(f"Transformation complete. Output saved to {output_csv_path}")
+            
+            # Step 7: Generate verification information and save to file
+            self.transformer.generate_verification_info(df_output, verification_file)
+            
+            return df_output
+            
+        except Exception as e:
+            self.logger.error(f"Workflow.run_transformation: Error in transformation workflow: {str(e)}")
+            self.logger.error(f"Traceback:", exc_info=True)
+            return None
+
+
+def main4():
+    """
+    Main function to handle command line arguments and execute the workflow.
+    """
+    try:
+        # Set up logging for the main function
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logger = logging.getLogger('main')
+        
+        # Parse command line arguments
+        if len(sys.argv) >= 3:
+            input_path = sys.argv[1]
+            output_path = sys.argv[2]
+            verification_file = sys.argv[3] if len(sys.argv) >= 4 else None
+        else:
+            # Default paths if not provided
+            input_path = r"C:\voiro-f\ADT\utils\beauty.csv"
+            output_path = "output_beauty.csv"
+            verification_file = None
+            logger.info(f"Using default paths: input={input_path}, output={output_path}")
+        
+        # Create and run the workflow
+        workflow = Workflow()
+        result = workflow.run_transformation(input_path, output_path, verification_file)
+        
+        if result is not None:
+            logger.info("Transformation completed successfully")
+            return 0
+        else:
+            logger.error("Transformation failed")
+            return 1
+            
+    except Exception as e:
+        logging.error(f"Unhandled exception in main: {str(e)}", exc_info=True)
+        return 1
+
+
+#if __name__ == "__main__":
+  # sys.exit(main())
